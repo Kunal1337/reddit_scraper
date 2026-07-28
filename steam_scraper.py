@@ -5,10 +5,22 @@ Pulls discussion threads (the original post = "post") and their replies
 (= "reply") from one or more game hubs, and appends to a single deduplicated
 CSV in the shared schema (so Reddit data can later flow into the same file).
 
+Built to collect OVER TIME:
+  - Threads aren't dropped just because they scroll off the "recent" list.
+    Any thread first seen within KNOWN_THREAD_MAX_AGE_DAYS keeps getting
+    re-checked for new replies, using what's already in the CSV as memory.
+  - Each thread's replies are paginated (not just the first page), stopping
+    early once a page brings back nothing new — so long threads accumulate
+    properly instead of being capped at the first N replies forever.
+
 There is no official API for Steam discussions, so this scrapes HTML with
 requests + BeautifulSoup. That makes the CSS SELECTORS the fragile part:
 if a run comes back with 0 records or empty text, use the --inspect helper
-to check a live page and fix the SELECTORS block.
+to check a live page and fix the SELECTORS block. The reply-pagination
+pattern (SELECTORS["ctp_param"] below) is the other fragile bit — if a long
+thread's replies never grow past the first page, that's usually why.
+Open a long thread in a browser, click through its comment pages, and check
+the URL pattern it actually uses.
 
 Setup (once):
     pip3 install requests beautifulsoup4
@@ -24,7 +36,7 @@ import csv
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 from bs4 import BeautifulSoup
@@ -42,10 +54,11 @@ APPID_TO_GAME = {
     "1222670": "The Sims 4",
 }
 
-FORUM_PAGES_PER_APP = 2     # how many pages of the thread list to walk
-THREADS_PER_APP = 15        # cap total threads scraped per game
-REPLIES_PER_THREAD = 40     # cap replies pulled per thread
-REQUEST_DELAY = 2.0         # seconds between requests — be polite, avoid throttling
+FORUM_PAGES_PER_APP = 2       # how many pages of the thread list to walk for FRESH threads
+THREADS_PER_APP = 15          # cap on fresh threads scraped per game, per run
+KNOWN_THREAD_MAX_AGE_DAYS = 30  # keep re-checking a thread for new replies for this many days after its first post
+MAX_REPLY_PAGES = 5           # walk up to this many comment pages per thread, per run
+REQUEST_DELAY = 2.0           # seconds between requests — be polite, avoid throttling
 OUTPUT_CSV = "engagement_data_steam.csv"
 
 # A real browser-like user agent; Steam is picky about bare-bones clients.
@@ -65,6 +78,7 @@ SELECTORS = {
     "reply_block": ".commentthread_comment",      # each reply container
     "reply_text":  ".commentthread_comment_text",
     "timestamp_attr": "data-timestamp",           # unix ts attribute Steam sets
+    "ctp_param": "ctp",                           # query param for comment page N — VERIFY on a live long thread
 }
 
 # The shared schema — identical to the Reddit scraper's columns.
@@ -139,7 +153,7 @@ def make_record(author_id, action_type, game, text, timestamp, permalink):
     }
 
 
-# --- Dedup helpers ----------------------------------------------------------
+# --- Dedup / memory helpers --------------------------------------------------
 
 def fingerprint(record):
     """Unique-enough key for a post/reply: which thread + who + when."""
@@ -155,6 +169,38 @@ def load_existing_fingerprints(path):
         for row in csv.DictReader(f):
             seen.add(fingerprint(row))
     return seen
+
+
+def load_known_threads(path):
+    """Map each previously-seen Steam permalink -> {game, first_seen}, using
+    the CSV itself as memory. This is what lets a thread keep being checked
+    for new replies even after it scrolls off Steam's 'recent' list."""
+    known = {}
+    if not os.path.exists(path):
+        return known
+    with open(path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            if row.get("source") != "steam":
+                continue
+            perma = row.get("permalink", "")
+            if not perma:
+                continue
+            ts = row.get("timestamp", "")
+            entry = known.setdefault(perma, {"game": row.get("game", ""), "first_seen": ts})
+            if ts and (not entry["first_seen"] or ts < entry["first_seen"]):
+                entry["first_seen"] = ts
+    return known
+
+
+def within_recheck_window(first_seen_iso, max_age_days):
+    if not first_seen_iso:
+        return False
+    try:
+        posted = datetime.fromisoformat(first_seen_iso)
+    except ValueError:
+        return False
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+    return posted >= cutoff
 
 
 # --- Core scrape ------------------------------------------------------------
@@ -178,8 +224,9 @@ def get_thread_urls(session, appid, pages):
     return urls
 
 
-def scrape_thread(session, url, game):
-    """Scrape one thread: the original post + its replies."""
+def scrape_thread(session, url, game, existing_fingerprints):
+    """Scrape one thread: the original post, then paginate through reply
+    pages until a page brings back nothing new or MAX_REPLY_PAGES is hit."""
     records = []
     try:
         html = get(session, url)
@@ -203,41 +250,83 @@ def scrape_thread(session, url, game):
             permalink=url,
         ))
 
-    # --- replies (action_type = "reply") ---
-    for block in soup.select(SELECTORS["reply_block"])[:REPLIES_PER_THREAD]:
-        text_el = block.select_one(SELECTORS["reply_text"])
-        text = clean(text_el.get_text()) if text_el else ""
-        if not text:
-            continue  # skip empty/deleted
-        records.append(make_record(
-            author_id=extract_author(block),
-            action_type="reply",
-            game=game,
-            text=text,
-            timestamp=read_timestamp(block),
-            permalink=url,
-        ))
+    # --- replies (action_type = "reply"), paginated ---
+    page = 1
+    while page <= MAX_REPLY_PAGES:
+        if page > 1:
+            sep = "&" if "?" in url else "?"
+            page_url = f"{url}{sep}{SELECTORS['ctp_param']}={page}"
+            try:
+                html = get(session, page_url)
+            except Exception as e:
+                print(f"  !! could not load reply page {page} for {url}: {e}")
+                break
+            soup = BeautifulSoup(html, "html.parser")
+
+        blocks = soup.select(SELECTORS["reply_block"])
+        if not blocks:
+            break  # no more reply pages
+
+        new_count = 0
+        for block in blocks:
+            text_el = block.select_one(SELECTORS["reply_text"])
+            text = clean(text_el.get_text()) if text_el else ""
+            if not text:
+                continue  # skip empty/deleted
+            record = make_record(
+                author_id=extract_author(block),
+                action_type="reply",
+                game=game,
+                text=text,
+                timestamp=read_timestamp(block),
+                permalink=url,
+            )
+            if fingerprint(record) not in existing_fingerprints:
+                new_count += 1
+            records.append(record)
+
+        # Page 1 is always worth capturing (dedup handles repeats at write
+        # time). Beyond that, stop once a page brings nothing new — we've
+        # caught up to what we already have for this thread.
+        if page > 1 and new_count == 0:
+            break
+        page += 1
 
     return records
 
 
-def scrape_app(session, appid, game):
+def scrape_app(session, appid, game, known_threads, existing_fingerprints):
     print(f"Scraping Steam discussions for {game} (app {appid})...")
-    thread_urls = get_thread_urls(session, appid, FORUM_PAGES_PER_APP)
-    print(f"  found {len(thread_urls)} threads; scraping up to {THREADS_PER_APP}")
+
+    fresh_urls = get_thread_urls(session, appid, FORUM_PAGES_PER_APP)[:THREADS_PER_APP]
+    fresh_set = set(fresh_urls)
+
+    # Bring back older threads for this game that are still inside the
+    # re-check window, so they keep accumulating replies instead of being
+    # dropped the moment something newer bumps them off the front page.
+    recheck_urls = [
+        perma for perma, info in known_threads.items()
+        if info["game"] == game
+        and perma not in fresh_set
+        and within_recheck_window(info["first_seen"], KNOWN_THREAD_MAX_AGE_DAYS)
+    ]
+
+    all_urls = fresh_urls + recheck_urls
+    print(f"  {len(fresh_urls)} fresh threads + {len(recheck_urls)} re-checked older threads = {len(all_urls)} total")
+
     records = []
-    for url in thread_urls[:THREADS_PER_APP]:
-        records.extend(scrape_thread(session, url, game))
+    for url in all_urls:
+        records.extend(scrape_thread(session, url, game, existing_fingerprints))
     print(f"  -> {len(records)} records")
     return records
 
 
-def scrape_all(appid_to_game):
+def scrape_all(appid_to_game, known_threads, existing_fingerprints):
     session = requests.Session()
     all_records = []
     for appid, game in appid_to_game.items():
         try:
-            all_records.extend(scrape_app(session, appid, game))
+            all_records.extend(scrape_app(session, appid, game, known_threads, existing_fingerprints))
         except Exception as e:
             print(f"  !! failed on app {appid}: {e}")
     return all_records
@@ -245,8 +334,9 @@ def scrape_all(appid_to_game):
 
 # --- CSV output: append only new records ------------------------------------
 
-def append_new(records, path=OUTPUT_CSV):
-    seen = load_existing_fingerprints(path)
+def append_new(records, path=OUTPUT_CSV, seen=None):
+    if seen is None:
+        seen = load_existing_fingerprints(path)
     new = [r for r in records if fingerprint(r) not in seen]
     file_exists = os.path.exists(path)
     with open(path, "a", newline="", encoding="utf-8") as f:
@@ -280,6 +370,12 @@ def inspect_page(url):
     print("0 matches on a selector = that selector needs updating in SELECTORS.")
     print("Tip: open the same URL in your browser, right-click an element,")
     print("     'Inspect', and read the real class names.")
+    print()
+    print("To verify reply pagination (SELECTORS['ctp_param']): open a thread")
+    print("with 40+ replies in your browser, click to a later comment page,")
+    print("and check whether the URL matches '<thread_url>?ctp=2' style —")
+    print("if it uses something else, update ctp_param or the page_url logic")
+    print("in scrape_thread() to match.")
 
 
 # --- Entry point ------------------------------------------------------------
@@ -288,8 +384,10 @@ def main():
     if len(sys.argv) >= 3 and sys.argv[1] == "--inspect":
         inspect_page(sys.argv[2])
         return
-    records = scrape_all(APPID_TO_GAME)
-    append_new(records)
+    known_threads = load_known_threads(OUTPUT_CSV)
+    existing_fingerprints = load_existing_fingerprints(OUTPUT_CSV)
+    records = scrape_all(APPID_TO_GAME, known_threads, existing_fingerprints)
+    append_new(records, seen=existing_fingerprints)
 
 
 if __name__ == "__main__":
