@@ -90,15 +90,60 @@ FIELDNAMES = [
 
 # --- HTTP helper ------------------------------------------------------------
 
+MAX_RETRIES = 3
+BACKOFF_BASE_SECONDS = 5
+MAX_CONSECUTIVE_THROTTLE_FAILURES = 5  # stop the WHOLE run if we hit this many blocked requests in a row
+
+_consecutive_throttle_failures = 0
+
+
+class ThrottledStop(Exception):
+    """Raised when too many requests in a row look like throttling. Signals
+    the caller to stop the entire run rather than continuing to push against
+    what looks like a block."""
+    pass
+
+
 def get(session, url):
-    """Fetch a URL politely, with a delay and mature-content cookie set."""
-    time.sleep(REQUEST_DELAY)
-    # This cookie skips the age gate that some mature games' forums show.
-    resp = session.get(url, headers=HEADERS,
-                       cookies={"wants_mature_content": "1", "birthtime": "0"},
-                       timeout=20)
-    resp.raise_for_status()
-    return resp.text
+    """Fetch a URL politely, with a delay and mature-content cookie set.
+    Retries with backoff on throttling-style responses (429/503) instead of
+    silently treating them the same as any other failure. If throttling keeps
+    happening across many requests in a row, raises ThrottledStop so the
+    whole run halts instead of grinding through the rest of the games."""
+    global _consecutive_throttle_failures
+    last_exc = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        time.sleep(REQUEST_DELAY)
+        try:
+            resp = session.get(
+                url, headers=HEADERS,
+                cookies={"wants_mature_content": "1", "birthtime": "0"},
+                timeout=20,
+            )
+        except requests.exceptions.RequestException as e:
+            last_exc = e
+            print(f"    ! network error (attempt {attempt}/{MAX_RETRIES}) for {url}: {e}")
+            continue
+
+        if resp.status_code in (429, 500, 502, 503, 504):
+            wait = BACKOFF_BASE_SECONDS * attempt
+            print(f"    ! got HTTP {resp.status_code} (attempt {attempt}/{MAX_RETRIES}) for {url} — waiting {wait}s")
+            time.sleep(wait)
+            last_exc = requests.exceptions.HTTPError(f"HTTP {resp.status_code} after {attempt} attempts")
+            continue
+
+        resp.raise_for_status()
+        _consecutive_throttle_failures = 0
+        return resp.text
+
+    _consecutive_throttle_failures += 1
+    if _consecutive_throttle_failures >= MAX_CONSECUTIVE_THROTTLE_FAILURES:
+        raise ThrottledStop(
+            f"{_consecutive_throttle_failures} requests in a row failed after retries — "
+            "stopping the run rather than continuing to push against a likely block."
+        )
+    raise last_exc
 
 
 # --- Parsing helpers --------------------------------------------------------
@@ -224,15 +269,20 @@ def get_thread_urls(session, appid, pages):
     return urls
 
 
-def scrape_thread(session, url, game, existing_fingerprints):
+def scrape_thread(session, url, game, existing_fingerprints, first_page_html=None):
     """Scrape one thread: the original post, then paginate through reply
-    pages until a page brings back nothing new or MAX_REPLY_PAGES is hit."""
+    pages until a page brings back nothing new or MAX_REPLY_PAGES is hit.
+    If first_page_html is provided (e.g. a caller already fetched page 1 to
+    check the post date), it's reused instead of fetching the same URL twice."""
     records = []
-    try:
-        html = get(session, url)
-    except Exception as e:
-        print(f"  !! could not load thread {url}: {e}")
-        return records
+    if first_page_html is not None:
+        html = first_page_html
+    else:
+        try:
+            html = get(session, url)
+        except Exception as e:
+            print(f"  !! could not load thread {url}: {e}")
+            return records
 
     soup = BeautifulSoup(html, "html.parser")
 
@@ -327,6 +377,9 @@ def scrape_all(appid_to_game, known_threads, existing_fingerprints):
     for appid, game in appid_to_game.items():
         try:
             all_records.extend(scrape_app(session, appid, game, known_threads, existing_fingerprints))
+        except ThrottledStop as e:
+            print(f"  !! stopping the entire run early: {e}")
+            break
         except Exception as e:
             print(f"  !! failed on app {appid}: {e}")
     return all_records
