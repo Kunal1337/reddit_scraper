@@ -11,8 +11,21 @@ Headers in Space Grotesk, body in IBM Plex Sans, numbers in IBM Plex Mono.
 Sentiment is still a placeholder column, so that section stays dormant until
 the column is filled in. Nothing here invents data.
 
+EA vs Player posts: EA_ACCOUNTS below is a manually maintained list of known
+official/community-manager Steam usernames. This can't be reliably inferred
+from scraped HTML alone (no verified "developer" badge selector exists yet —
+see steam_scraper.py's SELECTORS comment for that same fragility pattern),
+so it's a plain, editable list rather than a guess. Add real handles here to
+make the EA/Player split meaningful; it's empty by default.
+
+Language: detected from post/reply text via `langdetect`, bucketed into
+Chinese / Spanish / English / Other / Unknown. Detection on short slangy
+text (e.g. "gg", "lol nice") is unreliable — tested directly, and anything
+under LANGUAGE_MIN_CHARS is left as "Unknown" rather than guessed, since a
+wrong guess is worse than an honest blank here.
+
 Setup (once):
-    pip3 install streamlit pandas
+    pip3 install streamlit pandas langdetect
 
 Run:
     python3 -m streamlit run app.py
@@ -22,9 +35,20 @@ import datetime as dt
 
 import pandas as pd
 import streamlit as st
+from langdetect import detect, DetectorFactory, LangDetectException
+
+DetectorFactory.seed = 0  # deterministic results — langdetect is otherwise randomized per call
 
 CSV_PATH = "engagement_data_steam.csv"
 NON_AUTHORS = ["", "[unknown]", "[deleted]"]
+
+# Manually maintained — add known EA / community-manager Steam usernames here.
+# Anything not in this set is counted as a Player post. Empty by default since
+# this can't be inferred from the scrape itself; it needs real input from your
+# community team to be meaningful.
+EA_ACCOUNTS = set()
+
+LANGUAGE_MIN_CHARS = 20  # below this, detection is unreliable enough to just skip it
 
 st.set_page_config(page_title="Community Engagement Monitor", layout="wide")
 
@@ -151,6 +175,28 @@ def kpi_row(items):
     st.markdown(f'<div class="kpis">{cards}</div>', unsafe_allow_html=True)
 
 
+# --- Language detection ------------------------------------------------------
+
+def detect_language(text):
+    """Best-effort bucket: Chinese / Spanish / English / Other / Unknown.
+    Tested directly against short gaming-forum-style text: under ~20 chars,
+    detection is unreliable enough ("gg" -> Tagalog, "lol nice" -> Spanish)
+    that guessing does more harm than an honest "Unknown"."""
+    if not isinstance(text, str) or len(text.strip()) < LANGUAGE_MIN_CHARS:
+        return "Unknown"
+    try:
+        code = detect(text)
+    except LangDetectException:
+        return "Unknown"
+    if code.startswith("zh"):
+        return "Chinese"
+    if code == "es":
+        return "Spanish"
+    if code == "en":
+        return "English"
+    return "Other"
+
+
 # --- Data loading -----------------------------------------------------------
 
 @st.cache_data
@@ -158,9 +204,14 @@ def load_data(path):
     df = pd.read_csv(path)
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
     df["date"] = df["timestamp"].dt.date
-    for col in ["sentiment", "topic", "author_id", "game", "source", "action_type", "text", "permalink"]:
+    for col in ["sentiment", "topic", "author_id", "game", "source", "action_type", "text", "permalink", "locked"]:
         if col in df.columns:
             df[col] = df[col].fillna("").astype(str)
+    if "locked" not in df.columns:
+        df["locked"] = ""  # older CSV, pre-migration — treated as unknown/not locked below
+    df["is_locked"] = df["locked"].str.lower().eq("true")
+    df["language"] = df["text"].apply(detect_language)
+    df["poster_type"] = df["author_id"].apply(lambda a: "EA" if a in EA_ACCOUNTS else "Player")
     return df
 
 
@@ -195,6 +246,8 @@ def game_summary(data):
             "Game": game,
             "Records": len(g),
             "Posts": n_posts,
+            "EA posts": int((posts_g["poster_type"] == "EA").sum()),
+            "Player posts": int((posts_g["poster_type"] == "Player").sum()),
             "Replies": len(replies_g),
             "Unique authors": g[~g["author_id"].isin(NON_AUTHORS)]["author_id"].nunique(),
             "Unanswered": len(unanswered_g),
@@ -205,6 +258,53 @@ def game_summary(data):
     if not out.empty:
         out = out.sort_values("Records", ascending=False).reset_index(drop=True)
     return out
+
+
+def previous_period_range(date_range):
+    """Given the active (start, end) filter, return the immediately preceding
+    window of the same length — e.g. filtering to the last 7 days compares
+    against the 7 days before that. Returns None if there's no valid range."""
+    if not date_range or not isinstance(date_range, (list, tuple)) or len(date_range) != 2:
+        return None
+    start, end = date_range
+    length_days = (end - start).days + 1
+    prev_end = start - dt.timedelta(days=1)
+    prev_start = prev_end - dt.timedelta(days=length_days - 1)
+    return prev_start, prev_end
+
+
+def add_period_deltas(summary, data, sel_source, sel_language, date_range):
+    """Adds 'Δ Records' and 'Δ % unanswered' columns comparing the current
+    filtered window to the equivalent-length period immediately before it.
+    Blank (NaN) means there's no prior-period data for that game to compare
+    against yet — left blank rather than treated as a 0 baseline, since a
+    brand-new game isn't 'down 100%', it just has no history."""
+    prev_range = previous_period_range(date_range)
+    if prev_range is None:
+        return summary
+
+    prev_start, prev_end = prev_range
+    prev_data = data[data["source"].isin(sel_source)]
+    prev_data = prev_data[prev_data["language"].isin(sel_language)]
+    prev_data = prev_data[
+        ((prev_data["date"] >= prev_start) & (prev_data["date"] <= prev_end)) | prev_data["date"].isna()
+    ]
+    prev_summary = game_summary(prev_data)
+
+    if prev_summary.empty:
+        summary["Δ Records"] = pd.NA
+        summary["Δ % unanswered"] = pd.NA
+        return summary
+
+    merged = summary.merge(
+        prev_summary[["Game", "Records", "% unanswered"]].rename(
+            columns={"Records": "_prev_records", "% unanswered": "_prev_unanswered"}
+        ),
+        on="Game", how="left",
+    )
+    merged["Δ Records"] = merged["Records"] - merged["_prev_records"]
+    merged["Δ % unanswered"] = (merged["% unanswered"] - merged["_prev_unanswered"]).round(1)
+    return merged.drop(columns=["_prev_records", "_prev_unanswered"])
 
 
 def thread_table(data):
@@ -251,6 +351,7 @@ def multiselect_all(label, series):
 
 sel_source = multiselect_all("Source", df["source"])
 sel_game = multiselect_all("Game", df["game"])
+sel_language = multiselect_all("Language", df["language"])
 sel_action = multiselect_all("Type (post / reply)", df["action_type"])
 
 valid_dates = df["date"].dropna()
@@ -264,19 +365,22 @@ author_query = st.sidebar.text_input("Author contains").strip().lower()
 text_query = st.sidebar.text_input("Text contains (keyword)").strip().lower()
 
 st.sidebar.caption(f"Loaded {loaded_from}")
-st.sidebar.caption("Compare + Threads sections use Source + Date + Game. The detail view uses every filter.")
+st.sidebar.caption("Compare + Threads sections use Source + Date + Game + Language. The detail view uses every filter.")
+if not EA_ACCOUNTS:
+    st.sidebar.caption("⚠️ EA_ACCOUNTS list is empty — all posts currently count as Player. Add known EA/community-manager usernames in app.py to enable the EA vs Player split.")
 
 
 # --- Filtered frames --------------------------------------------------------
 
 def apply_source_date(data):
     out = data[data["source"].isin(sel_source)]
+    out = out[out["language"].isin(sel_language)]
     if date_range and isinstance(date_range, (list, tuple)) and len(date_range) == 2:
         start, end = date_range
         out = out[((out["date"] >= start) & (out["date"] <= end)) | out["date"].isna()]
     return out
 
-f_compare = apply_source_date(df)                    # source+date (all games)
+f_compare = apply_source_date(df)                    # source+date+language (all games)
 f_scope = f_compare[f_compare["game"].isin(sel_game)]  # + game (for thread-level views)
 
 f = f_scope.copy()                                    # + row-level filters (detail view)
@@ -299,12 +403,13 @@ hero(
 # --- Compare games ----------------------------------------------------------
 
 section("01 · Overview", "Compare games",
-        "All games side by side. The % unanswered and replies-per-post columns are size-independent, so they compare fairly even when one forum is far busier than another.")
+        "All games side by side. The % unanswered and replies-per-post columns are size-independent, so they compare fairly even when one forum is far busier than another. Δ columns compare the current date range to the equivalent-length period right before it.")
 
 summary = game_summary(f_compare)
 if summary.empty:
-    st.info("No game data in the current Source/Date range.")
+    st.info("No game data in the current Source/Date/Language range.")
 else:
+    summary = add_period_deltas(summary, df, sel_source, sel_language, date_range)
     st.dataframe(summary, use_container_width=True, hide_index=True)
     c1, c2 = st.columns(2)
     with c1:
@@ -313,6 +418,11 @@ else:
     with c2:
         st.caption("% of threads with no reply — higher means more players left waiting")
         st.bar_chart(summary.set_index("Game")["% unanswered"])
+
+    st.caption("Records by language")
+    lang_counts = f_compare[f_compare["language"] != ""]["language"].value_counts()
+    if not lang_counts.empty:
+        st.bar_chart(lang_counts)
 
 
 # --- Threads (active span) --------------------------------------------------
@@ -338,11 +448,14 @@ else:
 # --- Needs attention: unanswered --------------------------------------------
 
 section("03 · Needs attention", "Unanswered threads",
-        "Posts with zero replies, oldest first — the ones sitting open longest without anyone responding.")
+        "Posts with zero replies, oldest first — the ones sitting open longest without anyone responding. Locked threads are excluded: a moderator closing a thread isn't the same as players being left waiting.")
 
 posts_scope = f_scope[f_scope["action_type"] == "post"]
 replies_scope = f_scope[f_scope["action_type"] == "reply"]
-unanswered = posts_scope[~posts_scope["permalink"].isin(set(replies_scope["permalink"]))].copy()
+
+locked_zero_reply = posts_scope[posts_scope["is_locked"] & ~posts_scope["permalink"].isin(set(replies_scope["permalink"]))]
+open_posts = posts_scope[~posts_scope["is_locked"]]
+unanswered = open_posts[~open_posts["permalink"].isin(set(replies_scope["permalink"]))].copy()
 
 now = pd.Timestamp.now(tz="UTC")
 if not unanswered.empty:
@@ -350,6 +463,8 @@ if not unanswered.empty:
     unanswered = unanswered.sort_values("Age (days)", ascending=False, na_position="last")
 
 kpi_row([("Unanswered threads", f"{len(unanswered)}", True)])
+if len(locked_zero_reply) > 0:
+    st.caption(f"({len(locked_zero_reply)} locked thread(s) with no replies excluded from this list — closed, not waiting.)")
 
 if not unanswered.empty:
     view = unanswered.rename(columns={"game": "Game", "author_id": "Author", "text": "Thread", "permalink": "Link"})

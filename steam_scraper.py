@@ -81,10 +81,19 @@ SELECTORS = {
     "ctp_param": "ctp",                           # query param for comment page N — VERIFY on a live long thread
 }
 
+# Verified directly against a live locked Steam thread: locked topics show a
+# distinctly-named icon asset right next to "This topic has been locked" text
+# near the top of the page. A plain substring check on the raw HTML is more
+# robust here than guessing a CSS selector, since we don't have the exact
+# containing element's class name — only confirmed evidence of this filename.
+# If lock-detection ever silently stops working, this string is the first
+# thing to re-verify (same spirit as SELECTORS above).
+LOCKED_ICON_MARKER = "forum_topicicon_locked"
+
 # The shared schema — identical to the Reddit scraper's columns.
 FIELDNAMES = [
     "source", "author_id", "action_type", "game",
-    "text", "timestamp", "score", "sentiment", "topic", "permalink",
+    "text", "timestamp", "score", "sentiment", "topic", "permalink", "locked",
 ]
 
 
@@ -182,7 +191,7 @@ def extract_author(block):
     return ""
 
 
-def make_record(author_id, action_type, game, text, timestamp, permalink):
+def make_record(author_id, action_type, game, text, timestamp, permalink, locked=False):
     """One row in the shared schema. Steam has no per-post score, so it's blank."""
     return {
         "source": "steam",
@@ -195,6 +204,7 @@ def make_record(author_id, action_type, game, text, timestamp, permalink):
         "sentiment": "",     # placeholder — filled in later
         "topic": "",         # placeholder — filled in later
         "permalink": permalink,
+        "locked": "true" if locked else "false",
     }
 
 
@@ -285,6 +295,7 @@ def scrape_thread(session, url, game, existing_fingerprints, first_page_html=Non
             return records
 
     soup = BeautifulSoup(html, "html.parser")
+    is_locked = LOCKED_ICON_MARKER in html
 
     # --- original post (action_type = "post") ---
     op = soup.select_one(".forum_op")
@@ -298,6 +309,7 @@ def scrape_thread(session, url, game, existing_fingerprints, first_page_html=Non
             text=clean(text_el.get_text()) if text_el else "",
             timestamp=read_timestamp(op),
             permalink=url,
+            locked=is_locked,
         ))
 
     # --- replies (action_type = "reply"), paginated ---
@@ -330,6 +342,7 @@ def scrape_thread(session, url, game, existing_fingerprints, first_page_html=Non
                 text=text,
                 timestamp=read_timestamp(block),
                 permalink=url,
+                locked=is_locked,
             )
             if fingerprint(record) not in existing_fingerprints:
                 new_count += 1
@@ -423,6 +436,13 @@ def inspect_page(url):
     print("0 matches on a selector = that selector needs updating in SELECTORS.")
     print("Tip: open the same URL in your browser, right-click an element,")
     print("     'Inspect', and read the real class names.")
+    print()
+    if LOCKED_ICON_MARKER in html:
+        print(f"Locked-thread marker '{LOCKED_ICON_MARKER}' FOUND on this page — "
+              "if this page is NOT actually locked, that's a false positive to investigate.")
+    else:
+        print(f"Locked-thread marker '{LOCKED_ICON_MARKER}' not found on this page "
+              "(expected, unless you're inspecting a thread you know is locked).")
     print()
     print("To verify reply pagination (SELECTORS['ctp_param']): open a thread")
     print("with 40+ replies in your browser, click to a later comment page,")
