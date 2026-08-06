@@ -56,7 +56,7 @@ APPID_TO_GAME = {
 
 FORUM_PAGES_PER_APP = 2       # how many pages of the thread list to walk for FRESH threads
 THREADS_PER_APP = 15          # cap on fresh threads scraped per game, per run
-KNOWN_THREAD_MAX_AGE_DAYS = 30  # keep re-checking a thread for new replies for this many days after its first post
+KNOWN_THREAD_MAX_AGE_DAYS = 7   # keep re-checking a thread for new replies for this many days after its first post — kept short since the daily run's job is catching fresh replies, not re-walking old history (that's what backfill is for)
 MAX_REPLY_PAGES = 5           # walk up to this many comment pages per thread, per run
 REQUEST_DELAY = 2.0           # seconds between requests — be polite, avoid throttling
 OUTPUT_CSV = "engagement_data_steam.csv"
