@@ -42,11 +42,17 @@ DetectorFactory.seed = 0  # deterministic results — langdetect is otherwise ra
 CSV_PATH = "engagement_data_steam.csv"
 NON_AUTHORS = ["", "[unknown]", "[deleted]"]
 
-# Manually maintained — add known EA / community-manager Steam usernames here.
-# Anything not in this set is counted as a Player post. Empty by default since
-# this can't be inferred from the scrape itself; it needs real input from your
-# community team to be meaningful.
+# Official EA/community-manager accounts follow an "ea_" prefix convention
+# (e.g. "ea_shepard") — checked automatically below. EA_ACCOUNTS is a
+# fallback for any official accounts that don't follow that convention
+# (e.g. a community manager's personal profile); add real handles here only
+# for those exceptions.
 EA_ACCOUNTS = set()
+
+
+def is_ea_account(author_id):
+    return author_id.lower().startswith("ea_") or author_id in EA_ACCOUNTS
+
 
 LANGUAGE_MIN_CHARS = 20  # below this, detection is unreliable enough to just skip it
 
@@ -211,7 +217,7 @@ def load_data(path):
         df["locked"] = ""  # older CSV, pre-migration — treated as unknown/not locked below
     df["is_locked"] = df["locked"].str.lower().eq("true")
     df["language"] = df["text"].apply(detect_language)
-    df["poster_type"] = df["author_id"].apply(lambda a: "EA" if a in EA_ACCOUNTS else "Player")
+    df["poster_type"] = df["author_id"].apply(lambda a: "EA" if is_ea_account(a) else "Player")
     return df
 
 
@@ -366,8 +372,8 @@ text_query = st.sidebar.text_input("Text contains (keyword)").strip().lower()
 
 st.sidebar.caption(f"Loaded {loaded_from}")
 st.sidebar.caption("Compare + Threads sections use Source + Date + Game + Language. The detail view uses every filter.")
-if not EA_ACCOUNTS:
-    st.sidebar.caption("⚠️ EA_ACCOUNTS list is empty — all posts currently count as Player. Add known EA/community-manager usernames in app.py to enable the EA vs Player split.")
+if (df["poster_type"] == "EA").sum() == 0:
+    st.sidebar.caption("⚠️ No posts matched the 'ea_' prefix or EA_ACCOUNTS list — everything currently counts as Player. Check the prefix convention or add exceptions in app.py.")
 
 
 # --- Filtered frames --------------------------------------------------------
